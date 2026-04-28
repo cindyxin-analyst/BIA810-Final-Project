@@ -1,9 +1,11 @@
 streamlit
 langchain
 langchain-community
-langchain-ollama
+langchain-openai
 langchain-chroma
+langchain-text-splitters
 chromadb
 pypdf
 PyMuPDF
 rapidocr-onnxruntime
+python-dotenv
