@@ -1,9 +1,13 @@
 streamlit
+numpy==1.26.4
+protobuf==3.20.3
+
 langchain
 langchain-community
 langchain-openai
 langchain-chroma
 langchain-text-splitters
+
 chromadb
 pypdf
 PyMuPDF
