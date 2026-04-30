@@ -8,10 +8,10 @@ import uuid
 from typing import Dict, List, Tuple
 
 import pymupdf
+from openai import OpenAI
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rapidocr_onnxruntime import RapidOCR
 
@@ -32,18 +32,61 @@ from retrieval_queries import (
 )
 
 logger = logging.getLogger(__name__)
+
 NOT_FOUND = "Not found"
+
+
+class OpenAIEmbeddingFunction:
+    """
+    LangChain / Chroma-compatible embedding wrapper using OpenAI embeddings.
+    """
+
+    def __init__(
+        self,
+        client: OpenAI,
+        model: str = "text-embedding-3-small",
+    ) -> None:
+        self.client = client
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=texts,
+        )
+        return [item.embedding for item in response.data]
+
+    def embed_query(self, text: str) -> List[float]:
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=[text],
+        )
+        return response.data[0].embedding
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        # optional compatibility
+        return self.embed_documents(texts)
 
 
 class ContractRAG:
     def __init__(
         self,
-        llm_model: str = "gpt-4o-mini",
+        llm_model: str = "gpt-4.1-mini",
         embedding_model: str = "text-embedding-3-small",
         persist_directory: str | None = None,
     ) -> None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not set. Please set it as an environment variable."
+            )
+
         self.llm_model = llm_model
         self.embedding_model = embedding_model
+        self.client = OpenAI(api_key=api_key)
 
         if persist_directory is None:
             persist_directory = os.path.join("data", f"chroma_db_{uuid.uuid4().hex}")
@@ -51,8 +94,10 @@ class ContractRAG:
         self.persist_directory = persist_directory
         os.makedirs(self.persist_directory, exist_ok=True)
 
-        self.llm = ChatOpenAI(model=self.llm_model, temperature=0)
-        self.embeddings = OpenAIEmbeddings(model=self.embedding_model)
+        self.embedding_function = OpenAIEmbeddingFunction(
+            client=self.client,
+            model=self.embedding_model,
+        )
 
         self.vectorstore = None
         self.raw_docs: List[Document] = []
@@ -191,7 +236,8 @@ class ContractRAG:
             if len(doc.page_content) <= 1400:
                 split_docs.append(doc)
             else:
-                split_docs.extend(splitter.split_documents([doc]))
+                sub_docs = splitter.split_documents([doc])
+                split_docs.extend(sub_docs)
 
         return split_docs
 
@@ -232,7 +278,7 @@ class ContractRAG:
     def build_vectorstore(self, docs: List[Document]) -> None:
         self.vectorstore = Chroma.from_documents(
             documents=docs,
-            embedding=self.embeddings,
+            embedding=self.embedding_function,
             persist_directory=self.persist_directory,
             collection_name="nda_contracts",
         )
@@ -264,14 +310,14 @@ class ContractRAG:
         return "\n\n".join(parts)
 
     def _docs_to_sources(self, docs: List[Document], max_chars: int = 400) -> List[Dict]:
-        return [
-            {
+        sources = []
+        for doc in docs:
+            sources.append({
                 "page": doc.metadata.get("page", "unknown"),
                 "clause_title": doc.metadata.get("clause_title", "Unknown Clause"),
-                "supporting_text": doc.page_content[:max_chars],
-            }
-            for doc in docs
-        ]
+                "supporting_text": doc.page_content[:max_chars]
+            })
+        return sources
 
     def _get_first_pages_text(self, max_pages: int = 2) -> str:
         if not self.raw_docs:
@@ -286,8 +332,11 @@ class ContractRAG:
         return self._format_docs(selected)
 
     def _call_llm(self, prompt: str) -> str:
-        response = self.llm.invoke(prompt)
-        return response.content if hasattr(response, "content") else str(response)
+        response = self.client.responses.create(
+            model=self.llm_model,
+            input=prompt,
+        )
+        return response.output_text
 
     # ----------------------------
     # NDA key field extraction
@@ -308,21 +357,20 @@ class ContractRAG:
 
     def _normalize_field_value(self, value: str) -> str:
         v = (value or "").strip()
+
         if not v:
             return NOT_FOUND
+
         if v.lower() in {"not found", "n/a", "none", "null", "unknown"}:
             return NOT_FOUND
+
         return v
 
     def _extract_key_fields_regex(self, text: str) -> Dict[str, str]:
         result = self._empty_key_fields()
         text_one_line = " ".join(text.split())
 
-        if re.search(
-            r"non[- ]disclosure agreement|nda|confidentiality agreement",
-            text_one_line,
-            flags=re.IGNORECASE,
-        ):
+        if re.search(r"non[- ]disclosure agreement|nda|confidentiality agreement", text_one_line, flags=re.IGNORECASE):
             result["contract_type"] = "NDA / Confidentiality Agreement"
 
         effective_patterns = [
@@ -363,11 +411,7 @@ class ContractRAG:
         if markers:
             result["non_solicitation_or_non_compete"] = "; ".join(markers)
 
-        if re.search(
-            r"return\s+or\s+destroy|destroy\s+all\s+copies|return\s+all\s+materials",
-            text_one_line,
-            flags=re.IGNORECASE,
-        ):
+        if re.search(r"return\s+or\s+destroy|destroy\s+all\s+copies|return\s+all\s+materials", text_one_line, flags=re.IGNORECASE):
             result["return_or_destruction"] = "Return / destruction obligation detected."
 
         term_patterns = [
@@ -412,6 +456,9 @@ class ContractRAG:
                 merged[key] = fallback.get(key, NOT_FOUND)
         return merged
 
+    def _debug_log_fields(self, label: str, fields: Dict[str, str]) -> None:
+        logger.debug("%s: %s", label, fields)
+
     def extract_key_fields_simple(self) -> Dict[str, str]:
         if not self.raw_docs:
             raise ValueError("Raw documents are not loaded. Upload and process a PDF first.")
@@ -425,7 +472,18 @@ class ContractRAG:
         merged_fields = self._merge_missing_fields(
             merged_fields,
             raw_llm_result,
-            keys=list(self._empty_key_fields().keys()),
+            keys=[
+                "contract_type",
+                "parties",
+                "effective_date",
+                "purpose_of_disclosure",
+                "confidential_information_definition",
+                "exclusions",
+                "confidentiality_term",
+                "return_or_destruction",
+                "governing_law",
+                "non_solicitation_or_non_compete",
+            ],
         )
 
         missing_core = any(
@@ -458,6 +516,13 @@ class ContractRAG:
                 retrieved_llm_result,
                 keys=list(self._empty_key_fields().keys()),
             )
+
+            self._debug_log_fields("RETRIEVED REGEX RESULT", retrieved_regex_result)
+            self._debug_log_fields("RETRIEVED LLM RESULT", retrieved_llm_result)
+
+        self._debug_log_fields("RAW REGEX RESULT", raw_regex_result)
+        self._debug_log_fields("RAW LLM RESULT", raw_llm_result)
+        self._debug_log_fields("MERGED RESULT", merged_fields)
 
         return merged_fields
 
@@ -494,7 +559,7 @@ class ContractRAG:
         return self._call_llm(prompt)
 
     # ----------------------------
-    # NDA risk scoring
+    # NDA risk scoring (rule-based)
     # ----------------------------
     def _score_nda_risks(self, docs: List[Document]) -> Dict:
         findings = []
@@ -508,14 +573,16 @@ class ContractRAG:
             clause_score = 0
             reasons = []
 
-            long_term_match = re.search(r"(\d+)\s+(year|years)", text, flags=re.IGNORECASE)
+            long_term_match = re.search(
+                r"(\d+)\s+(year|years)",
+                text,
+                flags=re.IGNORECASE,
+            )
             if long_term_match:
                 years = int(long_term_match.group(1))
                 if years > 5:
                     clause_score += 25
-                    reasons.append(
-                        f"Confidentiality obligation may last more than 5 years ({years} years)."
-                    )
+                    reasons.append(f"Confidentiality obligation may last more than 5 years ({years} years).")
 
             if "exclusions" not in text.lower() and "shall not include" not in text.lower():
                 clause_score += 20
@@ -537,22 +604,18 @@ class ContractRAG:
                 clause_score += 15
                 reasons.append("Confidential information definition may be overly broad.")
 
-            if re.search(r"assign", text, flags=re.IGNORECASE) and re.search(
-                r"without consent", text, flags=re.IGNORECASE
-            ):
+            if re.search(r"assign", text, flags=re.IGNORECASE) and re.search(r"without consent", text, flags=re.IGNORECASE):
                 clause_score += 10
                 reasons.append("Assignment language may be one-sided.")
 
             if clause_score > 0:
-                findings.append(
-                    {
-                        "page": page,
-                        "clause_title": clause_title,
-                        "score": clause_score,
-                        "reasons": reasons,
-                        "supporting_text": text[:500],
-                    }
-                )
+                findings.append({
+                    "page": page,
+                    "clause_title": clause_title,
+                    "score": clause_score,
+                    "reasons": reasons,
+                    "supporting_text": text[:500]
+                })
                 total_score += clause_score
 
         overall_score = min(total_score, 100)
@@ -567,14 +630,28 @@ class ContractRAG:
         return {
             "overall_score": overall_score,
             "risk_level": risk_level,
-            "findings": findings,
+            "findings": findings
         }
 
     # ----------------------------
     # Public features
     # ----------------------------
     def summarize_contract(self) -> str:
-        return self.summarize_contract_with_sources()["summary"]
+        docs = self._retrieve_docs(query=GENERAL_SUMMARY_RETRIEVAL_QUERY, k=8)
+        context = self._format_docs(docs)
+
+        fields = self.extract_key_fields_simple()
+        field_block = self._format_key_fields_for_summary(fields)
+        term_summary = self._get_confidentiality_term_for_summary(fields)
+
+        combined_context = (
+            f"{field_block}\n"
+            f"Confidentiality Term Helper:\n{term_summary}\n\n"
+            f"Retrieved Contract Context:\n{context}"
+        )
+
+        prompt = SUMMARY_PROMPT.format(context=combined_context)
+        return self._call_llm(prompt)
 
     def summarize_contract_with_sources(self) -> Dict:
         docs = self._retrieve_docs(query=GENERAL_SUMMARY_RETRIEVAL_QUERY, k=8)
@@ -595,7 +672,7 @@ class ContractRAG:
 
         return {
             "summary": summary,
-            "sources": self._docs_to_sources(docs, max_chars=300),
+            "sources": self._docs_to_sources(docs, max_chars=300)
         }
 
     def analyze_risks(self) -> Dict:
@@ -633,7 +710,7 @@ Rule Findings:
         }
 
     # ----------------------------
-    # Q&A
+    # Question routing helpers
     # ----------------------------
     def _is_risk_question(self, normalized_question: str) -> bool:
         return any(
@@ -653,6 +730,107 @@ Rule Findings:
             ]
         )
 
+    def _is_field_question(self, normalized_question: str) -> bool:
+        return any(
+            phrase in normalized_question
+            for phrase in [
+                "effective date",
+                "parties",
+                "who are the parties",
+                "purpose",
+                "confidential information",
+                "exclusions",
+                "how long",
+                "term",
+                "duration",
+                "return or destroy",
+                "governing law",
+                "non-solicit",
+                "non solicit",
+                "non-compete",
+                "non compete",
+            ]
+        )
+
+    def _answer_risk_question(self, question: str) -> str:
+        docs = self._retrieve_docs(
+            query=RISK_QA_RETRIEVAL_QUERY,
+            k=8,
+        )
+        context = self._format_docs(docs)
+        prompt = RISK_QA_PROMPT.format(question=question, context=context)
+        return self._call_llm(prompt)
+
+    def _answer_effective_date_question(self, fields: Dict[str, str]) -> str:
+        value = self._normalize_field_value(fields["effective_date"])
+        if value != NOT_FOUND:
+            return f"The effective date is {value}."
+        return "The effective date is not clearly stated in the agreement."
+
+    def _answer_parties_question(self, fields: Dict[str, str]) -> str:
+        value = self._normalize_field_value(fields["parties"])
+        if value != NOT_FOUND:
+            return f"The parties are: {value}."
+        return "The parties are not clearly stated in the agreement."
+
+    def _answer_confidentiality_term_question(self, question: str, fields: Dict[str, str]) -> str:
+        value = self._normalize_field_value(fields["confidentiality_term"])
+        if value != NOT_FOUND:
+            return f"The confidentiality term is {value}."
+
+        docs = self._retrieve_docs(
+            query=CONFIDENTIALITY_TERM_RETRIEVAL_QUERY,
+            k=10,
+        )
+        context = self._format_docs(docs)
+        prompt = CONFIDENTIALITY_TERM_QA_PROMPT.format(question=question, context=context)
+        return self._call_llm(prompt)
+
+    def _answer_governing_law_question(self, fields: Dict[str, str]) -> str:
+        value = self._normalize_field_value(fields["governing_law"])
+        if value != NOT_FOUND:
+            return f"The governing law is {value}."
+        return "The governing law is not clearly stated in the agreement."
+
+    def _answer_exclusions_question(self, fields: Dict[str, str]) -> str:
+        value = self._normalize_field_value(fields["exclusions"])
+        if value != NOT_FOUND:
+            return f"The exclusions are: {value}"
+        return "The exclusions are not clearly stated in the agreement."
+
+    def _answer_return_destroy_question(self, fields: Dict[str, str]) -> str:
+        value = self._normalize_field_value(fields["return_or_destruction"])
+        if value != NOT_FOUND:
+            return value
+        return "The return or destruction obligation is not clearly stated in the agreement."
+
+    def _answer_field_question(self, question: str, normalized_question: str) -> str:
+        fields = self.extract_key_fields_simple()
+
+        if "effective date" in normalized_question:
+            return self._answer_effective_date_question(fields)
+
+        if "parties" in normalized_question or "who are the parties" in normalized_question:
+            return self._answer_parties_question(fields)
+
+        if (
+            "how long" in normalized_question
+            or "term" in normalized_question
+            or "duration" in normalized_question
+        ):
+            return self._answer_confidentiality_term_question(question, fields)
+
+        if "governing law" in normalized_question:
+            return self._answer_governing_law_question(fields)
+
+        if "exclusions" in normalized_question:
+            return self._answer_exclusions_question(fields)
+
+        if "return or destroy" in normalized_question:
+            return self._answer_return_destroy_question(fields)
+
+        return self._answer_general_question(question)
+
     def _answer_general_question(self, question: str) -> str:
         docs = self._retrieve_docs(query=question, k=5)
         context = self._format_docs(docs)
@@ -660,7 +838,15 @@ Rule Findings:
         return self._call_llm(prompt)
 
     def answer_question(self, question: str) -> str:
-        return self.answer_question_with_sources(question)["answer"]
+        normalized_question = question.lower().strip()
+
+        if self._is_risk_question(normalized_question):
+            return self._answer_risk_question(question)
+
+        if self._is_field_question(normalized_question):
+            return self._answer_field_question(question, normalized_question)
+
+        return self._answer_general_question(question)
 
     def answer_question_with_sources(self, question: str) -> Dict:
         normalized_question = question.lower().strip()
@@ -672,7 +858,7 @@ Rule Findings:
             answer = self._call_llm(prompt)
             return {
                 "answer": answer,
-                "sources": self._docs_to_sources(docs),
+                "sources": self._docs_to_sources(docs)
             }
 
         docs = self._retrieve_docs(query=question, k=5)
@@ -682,5 +868,5 @@ Rule Findings:
 
         return {
             "answer": answer,
-            "sources": self._docs_to_sources(docs),
+            "sources": self._docs_to_sources(docs)
         }

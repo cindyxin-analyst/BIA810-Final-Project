@@ -11,7 +11,7 @@ from contract_rag import ContractRAG
 st.set_page_config(page_title="AI NDA Analyzer", layout="wide")
 
 st.title("AI NDA Analyzer")
-st.caption("AI-powered NDA analysis with OpenAI, RAG, risk scoring, and source citation")
+st.caption("Local RAG + Risk Analysis + Source Citation with Ollama")
 
 
 if "rag" not in st.session_state:
